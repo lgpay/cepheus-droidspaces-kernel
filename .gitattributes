@@ -5,6 +5,10 @@
 *.py         text eol=lf
 *.md         text eol=lf
 
+# Patches must stay LF: `git apply` matches context byte-for-byte against
+# the (LF) C sources, so a CRLF checkout would fail to apply.
+*.patch      text eol=lf
+
 # AnyKernel3 skeleton is kept exactly as shipped in the v5 zip (CRLF and all),
 # because that exact tree is the one already proven to flash on this device.
 ak3/**       -text

@@ -1,0 +1,25 @@
+From: lg <lgpay@users.noreply.github.com>
+Subject: [PATCH] fs: clamp max_fd in the close_range() backport
+
+The 5.9 close_range() backport is missing upstream's fd-table clamp, so
+close_range(3, ~0U, 0) loops forever inside the syscall. Android bionic never
+calls it; glibc/systemd inside containers do, which hangs systemd at boot.
+
+---
+ fs/file.c | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+--- a/fs/file.c
++++ b/fs/file.c
+@@ -705,6 +705,11 @@
+ static inline void __range_close(struct files_struct *cur_fds, unsigned int fd,
+ 				 unsigned int max_fd)
+ {
++	/* Make sure we're using the correct maximum value. */
++	spin_lock(&cur_fds->file_lock);
++	max_fd = min(last_fd(files_fdtable(cur_fds)), max_fd);
++	spin_unlock(&cur_fds->file_lock);
++
+ 	while (fd <= max_fd) {
+ 		struct file *file;
+ 
