@@ -65,11 +65,23 @@ jobs:
           set -euo pipefail
           cd "$RUNNER_TEMP/kernel"
           rm -rf KernelSU-Next
-          git clone --quiet https://github.com/KernelSU-Next/KernelSU-Next.git KernelSU-Next
-          cd KernelSU-Next
-          git checkout --quiet "${{ inputs.ksu_ref }}"
-          echo "KSU-Next: $(git log -1 --format='%H %ad %s' --date=short)"
-          test -f kernel/Kconfig || { echo "::error::KernelSU-Next/kernel/Kconfig missing"; exit 1; }
+          mkdir -p KernelSU-Next
+          # Tarball instead of git clone: this repo is partial-clone friendly and
+          # `git checkout <sha>` fails with "unable to read tree" on CI runners.
+          KSU_SHA="${{ inputs.ksu_ref }}"
+          URL="https://codeload.github.com/KernelSU-Next/KernelSU-Next/tar.gz/${KSU_SHA}"
+          echo "downloading $URL"
+          curl -fsSL --retry 4 --retry-delay 5 --connect-timeout 25 -o "$RUNNER_TEMP/ksu.tar.gz" "$URL"
+          tar -xzf "$RUNNER_TEMP/ksu.tar.gz" -C KernelSU-Next --strip-components=1
+          rm -f "$RUNNER_TEMP/ksu.tar.gz"
+          test -f KernelSU-Next/kernel/Kconfig || {
+            echo "::error::KernelSU-Next/kernel/Kconfig missing"
+            ls -la KernelSU-Next
+            exit 1
+          }
+          echo "KSU-Next @ $KSU_SHA extracted:"
+          ls KernelSU-Next | head -20
+          head -3 KernelSU-Next/kernel/Makefile
 
       - name: Apply close_range() fix
         run: |
