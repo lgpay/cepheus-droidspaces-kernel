@@ -82,14 +82,23 @@ jobs:
           set -euo pipefail
           cd "$RUNNER_TEMP/kernel"
           rm -rf KernelSU-Next
-          # Full git clone, NOT a tarball: KernelSU-Next's Makefile derives its
-          # version (string + code) from git describe / rev-list. A tarball has
-          # no .git, which silently produced a kernel whose image contained no
-          # "v3.0.1-legacy" string and an unverifiable version code.
-          # (The "unable to read tree" failure only affects filtered/partial
-          # clones; a plain full clone checks out the pinned SHA fine.)
-          git clone https://github.com/KernelSU-Next/KernelSU-Next.git KernelSU-Next
-          git -C KernelSU-Next checkout "${{ inputs.ksu_ref }}"
+          # Real git checkout, NOT a tarball: KernelSU-Next's Makefile derives
+          # its version (string + code) from git describe / rev-list. A tarball
+          # has no .git, which silently produced a kernel whose image contained
+          # no "v3.0.1-legacy" string and an unverifiable version code.
+          # Fetch mechanics matter: the pinned commit is NOT reachable from any
+          # current branch head of KernelSU-Next (the legacy line was rewritten
+          # upstream), so a plain clone does not contain it and checkout dies
+          # with "reference is not a tree" — the same trap the old tarball
+          # comment warned about, one level deeper. GitHub does serve
+          # arbitrary SHAs to a direct fetch, so: init, fetch tags (needed
+          # for git describe), fetch the pinned SHA itself, then check out.
+          mkdir -p KernelSU-Next
+          git -C KernelSU-Next init -q
+          git -C KernelSU-Next remote add origin https://github.com/KernelSU-Next/KernelSU-Next.git
+          git -C KernelSU-Next fetch -q --tags origin
+          git -C KernelSU-Next fetch -q origin "${{ inputs.ksu_ref }}"
+          git -C KernelSU-Next checkout -q "${{ inputs.ksu_ref }}"
           KSU_HEAD="$(git -C KernelSU-Next rev-parse HEAD)"
           if [ "$KSU_HEAD" != "${{ inputs.ksu_ref }}" ]; then
             echo "::error::KernelSU-Next HEAD $KSU_HEAD != pinned ${{ inputs.ksu_ref }}"
