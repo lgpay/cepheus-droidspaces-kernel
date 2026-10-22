@@ -74,7 +74,7 @@ export CROSS_COMPILE=aarch64-linux-gnu-
 export CROSS_COMPILE_ARM32=arm-linux-gnueabi-
 make -j"$(nproc)" O=out CC=clang AR=llvm-ar LD=ld.lld NM=llvm-nm \
      OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip \
-     HOSTLDLIBS_dtc=-lyaml \
+     HOSTLOADLIBES_dtc=-lyaml \
      Image.gz-dtb
 ```
 
@@ -201,14 +201,18 @@ gcc -O2 -o /tmp/cr /tmp/cr.c && time /tmp/cr
 7. **`olddefconfig` 会静默补/删选项**。它跑完必须 diff 一遍最终 `out/.config` 和 `cepheus-crDroid-Droidspaces-v5-config.txt`，确认关键项没被翻转（尤其 `KSU`、`SCHED_WALT`、`CFS_BANDWIDTH`）。
 8. **任何格式的 CRLF 都可能刷机失败**。C 源码里 CRLF 无所谓，但 `anykernel.sh` / `update-binary` 被转成 CRLF 时 TWRP 会报 `\r` 语法错。仓库已用 `.gitattributes` 把 workflow / python / patch 钉成 LF。
 9. **卡死过的机器必须先重启**。v5 那批 `R` 状态死循环进程 `SIGKILL` 无效，只能重启清；容器 `run_at_boot=0`，不会自启。
-10. **`scripts/dtc` 缺 libyaml 会挂**（这次 CI 第一次编译就死在这）。症状很长但很好认：
+10. **`scripts/dtc` 缺 libyaml 会挂**（云端两次编译都死在这，第二次是变量名写错）。症状很好认：
     ```
     ld.lld: error: undefined symbol: yaml_emitter_initialize
     >>> referenced by yamltree.c
     >>>               scripts/dtc/yamltree.o:(yaml_tree)
     make[3]: *** [scripts/Makefile.host:111: scripts/dtc/dtc] Error 1
     ```
-    两件事一起做：`apt install libyaml-dev pkg-config`，并在 make 命令行显式加 **`HOSTLDLIBS_dtc=-lyaml`**（保证 `-lyaml` 出现在对象文件之后）。注意这是**宿主工具**链问题，跟内核配置无关，换 `.config` 不会好。
+    这棵树 `scripts/dtc/Makefile` 的逻辑是：`pkg-config --exists yaml-0.1` 成功才编 `yamltree.o`。所以二选一：
+    - **方案 A（推荐、最省事）**：机器上**没有** `libyaml-dev` → 自动 `-DNO_YAML` → 根本不编 `yamltree.o`。上游作者的环境就是这样，dtc 不需要 yaml。
+    - **方案 B**：机器上装了 `libyaml-dev`，就必须显式传库：**`HOSTLOADLIBES_dtc=-lyaml`**。
+      ⚠️ 变量名别写错：4.14 的 `scripts/Makefile.host` 链接规则展开的是 **`HOSTLOADLIBES_$(@F)`**；新内核里那个 `HOSTLDLIBS_dtc` 在这里**会被完全忽略**（云端第二次就是栽在这）。
+    两者都是**宿主工具**链问题，跟内核 `.config` 无关，换配置不会好。
 11. **别随手加 `LLVM_IAS=1`**。上游作者自己的 `build.sh` 也没设，4.14 这棵老树的汇编用集成汇编器容易出问题——照抄他能跑的那套。
 
 ---
