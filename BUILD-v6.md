@@ -69,14 +69,16 @@ grep -c 'min(last_fd(files_fdtable(cur_fds)), max_fd)' fs/file.c    # 必须输�
 # --- 用你编 v5 的同一套命令重编（这里给参考参数，替换成你自己的）---
 export ARCH=arm64 SUBARCH=arm64
 export PATH=<clang>/bin:$PATH
-export LLVM=1 LLVM_IAS=1
+export LLVM=1
 export CROSS_COMPILE=aarch64-linux-gnu-
 export CROSS_COMPILE_ARM32=arm-linux-gnueabi-
 make -j"$(nproc)" O=out CC=clang AR=llvm-ar LD=ld.lld NM=llvm-nm \
      OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip \
+     HOSTLDLIBS_dtc=-lyaml \
      Image.gz-dtb
 ```
 
+> 上面这套与上游作者的 `build.sh` 一致（clang `r416183b1` + `ld.lld`），只多了 `HOSTLDLIBS_dtc=-lyaml`（见坑 10）。
 > 注意产物目标必须是 **`Image.gz-dtb`**（AK3 的 `write_boot` 找的是这个名字），不是 `Image`。
 
 然后跳到第 5 节打包。
@@ -199,6 +201,15 @@ gcc -O2 -o /tmp/cr /tmp/cr.c && time /tmp/cr
 7. **`olddefconfig` 会静默补/删选项**。它跑完必须 diff 一遍最终 `out/.config` 和 `cepheus-crDroid-Droidspaces-v5-config.txt`，确认关键项没被翻转（尤其 `KSU`、`SCHED_WALT`、`CFS_BANDWIDTH`）。
 8. **任何格式的 CRLF 都可能刷机失败**。C 源码里 CRLF 无所谓，但 `anykernel.sh` / `update-binary` 被转成 CRLF 时 TWRP 会报 `\r` 语法错。仓库已用 `.gitattributes` 把 workflow / python / patch 钉成 LF。
 9. **卡死过的机器必须先重启**。v5 那批 `R` 状态死循环进程 `SIGKILL` 无效，只能重启清；容器 `run_at_boot=0`，不会自启。
+10. **`scripts/dtc` 缺 libyaml 会挂**（这次 CI 第一次编译就死在这）。症状很长但很好认：
+    ```
+    ld.lld: error: undefined symbol: yaml_emitter_initialize
+    >>> referenced by yamltree.c
+    >>>               scripts/dtc/yamltree.o:(yaml_tree)
+    make[3]: *** [scripts/Makefile.host:111: scripts/dtc/dtc] Error 1
+    ```
+    两件事一起做：`apt install libyaml-dev pkg-config`，并在 make 命令行显式加 **`HOSTLDLIBS_dtc=-lyaml`**（保证 `-lyaml` 出现在对象文件之后）。注意这是**宿主工具**链问题，跟内核配置无关，换 `.config` 不会好。
+11. **别随手加 `LLVM_IAS=1`**。上游作者自己的 `build.sh` 也没设，4.14 这棵老树的汇编用集成汇编器容易出问题——照抄他能跑的那套。
 
 ---
 
@@ -206,6 +217,7 @@ gcc -O2 -o /tmp/cr /tmp/cr.c && time /tmp/cr
 
 | 文件 | 作用 |
 |---|---|
+| `BUILD-v6.md` | 本文件：v5→v6 的编译差异、两条路线、自检、坑清单 |
 | `patches/0001-fs-clamp-max_fd-in-close_range-backport.patch` | 标准 git patch，`git apply` 直接用 |
 | `scripts/apply-kernel-fixes.py` | 幂等补丁器，锚点找不到**报错退出**（防上游改动后静默跳过） |
 | `cepheus-crDroid-Droidspaces-v5-config.txt` | v5 的 `.config`，v6 原样复用 |
