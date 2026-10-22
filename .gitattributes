@@ -1,0 +1,10 @@
+# Keep CI/build inputs byte-stable and LF: a CRLF workflow turns every
+# block-scalar shell line into "...\r", which bash rejects.
+*.yml        text eol=lf
+*.yaml       text eol=lf
+*.py         text eol=lf
+*.md         text eol=lf
+
+# AnyKernel3 skeleton is kept exactly as shipped in the v5 zip (CRLF and all),
+# because that exact tree is the one already proven to flash on this device.
+ak3/**       -text
