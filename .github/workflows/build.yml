@@ -1,0 +1,185 @@
+name: Build cepheus Droidspaces kernel
+
+# Builds the cepheus (Mi 9) Droidspaces kernel from the InfiniR source tree,
+# applies the close_range() fix, and packages an AnyKernel3 flashable zip.
+#
+# Reproducibility: source commit, KSU-Next commit and .config are all pinned.
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_branch:
+        description: 'raystef66/kernel_xiaomi_cepheus branch'
+        default: '16.0-ksun'
+        required: true
+      expected_commit:
+        description: 'Expected branch head (reproducibility guard)'
+        default: '6ad047b70d809d7dee1fc090dbe2c252ff43b7eb'
+        required: true
+      ksu_ref:
+        description: 'KernelSU-Next ref to check out'
+        default: '00cb93e0bc8bf3ca3680c7e8a3d7cf11d0b59071'
+        required: true
+      artifact_name:
+        description: 'Output zip filename'
+        default: 'cepheus-crDroid-Droidspaces-v6.zip'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+
+    steps:
+      - name: Checkout packaging repo
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            bc bison flex libssl-dev libelf-dev libncurses-dev \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi \
+            python3 zip unzip xz-utils cpio rsync lz4 zstd
+
+      - name: Fetch kernel source
+        run: |
+          set -euo pipefail
+          git clone --depth=1 --single-branch --branch "${{ inputs.kernel_branch }}" \
+            https://github.com/raystef66/kernel_xiaomi_cepheus.git "$RUNNER_TEMP/kernel"
+          cd "$RUNNER_TEMP/kernel"
+          HEAD_SHA="$(git rev-parse HEAD)"
+          echo "kernel HEAD: $HEAD_SHA"
+          echo "HEAD_SHA=$HEAD_SHA" >> "$GITHUB_ENV"
+          if [ "$HEAD_SHA" != "${{ inputs.expected_commit }}" ]; then
+            echo "::error::branch head $HEAD_SHA does not match expected ${{ inputs.expected_commit }}; upstream moved. Re-verify before building."
+            exit 1
+          fi
+          head -5 Makefile
+
+      - name: Fetch KernelSU-Next at pinned commit
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/kernel"
+          rm -rf KernelSU-Next
+          git clone --quiet https://github.com/KernelSU-Next/KernelSU-Next.git KernelSU-Next
+          cd KernelSU-Next
+          git checkout --quiet "${{ inputs.ksu_ref }}"
+          echo "KSU-Next: $(git log -1 --format='%H %ad %s' --date=short)"
+          test -f kernel/Kconfig || { echo "::error::KernelSU-Next/kernel/Kconfig missing"; exit 1; }
+
+      - name: Apply close_range() fix
+        run: |
+          set -euo pipefail
+          python3 "$GITHUB_WORKSPACE/scripts/apply-kernel-fixes.py" "$RUNNER_TEMP/kernel"
+
+      - name: Configure kernel
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/kernel"
+          mkdir -p out
+          cp "$GITHUB_WORKSPACE/cepheus-crDroid-Droidspaces-v5-config.txt" out/.config
+          make ARCH=arm64 SUBARCH=arm64 O=out olddefconfig
+          echo "--- sanity checks ---"
+          for k in CONFIG_KSU CONFIG_KSU_MANUAL_HOOK CONFIG_CFS_BANDWIDTH \
+                   CONFIG_POSIX_MQUEUE CONFIG_MACH_XIAOMI_CEPHEUS CONFIG_OVERLAY_FS; do
+            grep -m1 -E "^(${k}=|# ${k} is not set)" out/.config || echo "!! $k ABSENT"
+          done
+          grep -m1 '^CONFIG_LOCALVERSION=' out/.config
+
+      - name: Download clang toolchain
+        run: |
+          set -euo pipefail
+          TC="$RUNNER_TEMP/clang"
+          mkdir -p "$TC"
+          cd "$TC"
+          for URL in \
+            "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android12-release/clang-r416183b1.tar.gz" \
+            "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-r416183b1.tar.gz" ; do
+            echo "trying $URL"
+            if curl -fsSL --retry 4 --retry-delay 5 --connect-timeout 25 -o clang.tar.gz "$URL"; then
+              echo "downloaded from $URL"
+              break
+            fi
+            rm -f clang.tar.gz
+          done
+          test -s clang.tar.gz || { echo "::error::clang download failed"; exit 1; }
+          tar -xzf clang.tar.gz -C .
+          rm -f clang.tar.gz
+          ./bin/clang --version
+
+      - name: Build kernel
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/kernel"
+          export ARCH=arm64 SUBARCH=arm64
+          export PATH="$RUNNER_TEMP/clang/bin:$PATH"
+          export LLVM=1 LLVM_IAS=1
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+          set +e
+          make -j"$(nproc)" O=out \
+            CC=clang AR=llvm-ar LD=ld.lld NM=llvm-nm \
+            OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip \
+            Image.gz-dtb > "$RUNNER_TEMP/build.log" 2>&1
+          RC=$?
+          set -e
+          if [ $RC -ne 0 ]; then
+            echo "=== BUILD FAILED (rc=$RC) - last 200 lines ==="
+            tail -n 200 "$RUNNER_TEMP/build.log"
+            echo "=== grep errors ==="
+            grep -nE "error:|Error [0-9]|No rule to make" "$RUNNER_TEMP/build.log" | tail -n 40 || true
+            exit $RC
+          fi
+          echo "=== build ok, tail of log ==="
+          tail -n 15 "$RUNNER_TEMP/build.log"
+          ls -lh out/arch/arm64/boot/Image.gz-dtb
+
+      - name: Package AnyKernel3 zip
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/kernel"
+          cp out/.config "$GITHUB_WORKSPACE/build-config.txt"
+
+          rm -rf "$RUNNER_TEMP/ak3"
+          cp -r "$GITHUB_WORKSPACE/ak3" "$RUNNER_TEMP/ak3"
+          cp out/arch/arm64/boot/Image.gz-dtb "$RUNNER_TEMP/ak3/"
+
+          cd "$RUNNER_TEMP/ak3"
+          # Reflect this build in the recovery banner.
+          VSTR="${{ inputs.artifact_name }}"
+          VSTR="${VSTR%.zip}"
+          sed -i "s|^kernel.string=.*|kernel.string=cepheus Droidspaces ${VSTR} (close_range fix) 4.14.355-openela-Droidspaces|" anykernel.sh
+          grep -m1 '^kernel.string=' anykernel.sh
+
+          ZIPPATH="$RUNNER_TEMP/${{ inputs.artifact_name }}"
+          zip -r9 "$ZIPPATH" . -x '*.zip' > /dev/null
+          ls -lh "$ZIPPATH"
+          sha256sum "$ZIPPATH" | tee "$RUNNER_TEMP/SHA256SUMS"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-zip
+          path: |
+            ${{ runner.temp }}/${{ inputs.artifact_name }}
+            ${{ runner.temp }}/SHA256SUMS
+            build-config.txt
+          if-no-files-found: error
+
+      - name: Attach to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.artifact_name }}
+          name: ${{ inputs.artifact_name }}
+          body: |
+            Built from raystef66/kernel_xiaomi_cepheus @ ${{ env.HEAD_SHA }}
+            KernelSU-Next @ ${{ inputs.ksu_ref }}
+            Includes the `close_range()` fd-table clamp fix (see PATCH_NOTES.md).
+          files: |
+            ${{ runner.temp }}/${{ inputs.artifact_name }}
+            ${{ runner.temp }}/SHA256SUMS
+          fail_on_unmatched_files: false
