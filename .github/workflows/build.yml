@@ -4,6 +4,14 @@ name: Build cepheus Droidspaces kernel
 # applies the close_range() fix, and packages an AnyKernel3 flashable zip.
 #
 # Reproducibility: source commit, KSU-Next commit and .config are all pinned.
+#
+# Two hard-won rules baked into this workflow:
+#  1. KernelSU-Next MUST be fetched as a real git checkout. Its Makefile
+#     derives the embedded version string/code from git; the old tarball
+#     fetch silently produced a kernel with no "v3.0.1-legacy" string.
+#     The "Verify built image" step below is the regression gate for that.
+#  2. The toolchain is clang r547379 — the one the flash-verified local
+#     v5/v6 builds used. No silent fallback to a different clang.
 
 on:
   workflow_dispatch:
@@ -23,6 +31,14 @@ on:
       artifact_name:
         description: 'Output zip filename'
         default: 'cepheus-crDroid-Droidspaces-v6.zip'
+        required: true
+      release_tag:
+        description: 'Release tag to create or update'
+        default: 'v6'
+        required: true
+      release_title:
+        description: 'Release title'
+        default: 'v6 — cepheus Droidspaces kernel (crDroid 16)'
         required: true
 
 permissions:
@@ -66,23 +82,32 @@ jobs:
           set -euo pipefail
           cd "$RUNNER_TEMP/kernel"
           rm -rf KernelSU-Next
-          mkdir -p KernelSU-Next
-          # Tarball instead of git clone: this repo is partial-clone friendly and
-          # `git checkout <sha>` fails with "unable to read tree" on CI runners.
-          KSU_SHA="${{ inputs.ksu_ref }}"
-          URL="https://codeload.github.com/KernelSU-Next/KernelSU-Next/tar.gz/${KSU_SHA}"
-          echo "downloading $URL"
-          curl -fsSL --retry 4 --retry-delay 5 --connect-timeout 25 -o "$RUNNER_TEMP/ksu.tar.gz" "$URL"
-          tar -xzf "$RUNNER_TEMP/ksu.tar.gz" -C KernelSU-Next --strip-components=1
-          rm -f "$RUNNER_TEMP/ksu.tar.gz"
+          # Full git clone, NOT a tarball: KernelSU-Next's Makefile derives its
+          # version (string + code) from git describe / rev-list. A tarball has
+          # no .git, which silently produced a kernel whose image contained no
+          # "v3.0.1-legacy" string and an unverifiable version code.
+          # (The "unable to read tree" failure only affects filtered/partial
+          # clones; a plain full clone checks out the pinned SHA fine.)
+          git clone https://github.com/KernelSU-Next/KernelSU-Next.git KernelSU-Next
+          git -C KernelSU-Next checkout "${{ inputs.ksu_ref }}"
+          KSU_HEAD="$(git -C KernelSU-Next rev-parse HEAD)"
+          if [ "$KSU_HEAD" != "${{ inputs.ksu_ref }}" ]; then
+            echo "::error::KernelSU-Next HEAD $KSU_HEAD != pinned ${{ inputs.ksu_ref }}"
+            exit 1
+          fi
+          DESCRIBE="$(git -C KernelSU-Next describe --tags)"
+          echo "KernelSU-Next describe: $DESCRIBE"
+          if [ "${{ inputs.ksu_ref }}" = "00cb93e0bc8bf3ca3680c7e8a3d7cf11d0b59071" ] && [ "$DESCRIBE" != "v3.0.1-legacy-88-g00cb93e0" ]; then
+            echo "::error::unexpected KernelSU-Next describe: $DESCRIBE (expected v3.0.1-legacy-88-g00cb93e0)"
+            exit 1
+          fi
           test -f KernelSU-Next/kernel/Kconfig || {
             echo "::error::KernelSU-Next/kernel/Kconfig missing"
             ls -la KernelSU-Next
             exit 1
           }
-          echo "KSU-Next @ $KSU_SHA extracted:"
+          echo "KSU-Next @ $KSU_HEAD ready:"
           ls KernelSU-Next | head -20
-          head -3 KernelSU-Next/kernel/Makefile
 
       - name: Apply close_range() fix
         run: |
@@ -96,12 +121,26 @@ jobs:
           mkdir -p out
           cp "$GITHUB_WORKSPACE/cepheus-crDroid-Droidspaces-v5-config.txt" out/.config
           make ARCH=arm64 SUBARCH=arm64 O=out olddefconfig
-          echo "--- sanity checks ---"
-          for k in CONFIG_KSU CONFIG_KSU_MANUAL_HOOK CONFIG_CFS_BANDWIDTH \
-                   CONFIG_POSIX_MQUEUE CONFIG_MACH_XIAOMI_CEPHEUS CONFIG_OVERLAY_FS; do
-            grep -m1 -E "^(${k}=|# ${k} is not set)" out/.config || echo "!! $k ABSENT"
+          echo "--- sanity checks (hard fail) ---"
+          fail=0
+          for k in CONFIG_KSU CONFIG_KSU_MANUAL_HOOK CONFIG_KSU_SUSFS \
+                   CONFIG_CFS_BANDWIDTH CONFIG_POSIX_MQUEUE \
+                   CONFIG_MACH_XIAOMI_CEPHEUS CONFIG_OVERLAY_FS; do
+            if ! grep -q "^${k}=y" out/.config; then
+              echo "::error::$k is not =y in final .config"
+              fail=1
+            fi
           done
-          grep -m1 '^CONFIG_LOCALVERSION=' out/.config
+          if ! grep -q '^# CONFIG_SCHED_WALT is not set' out/.config; then
+            echo "::error::CONFIG_SCHED_WALT must be off"
+            fail=1
+          fi
+          if ! grep -q '^CONFIG_LOCALVERSION="-Droidspaces"' out/.config; then
+            echo "::error::CONFIG_LOCALVERSION is not \"-Droidspaces\""
+            fail=1
+          fi
+          [ "$fail" = 0 ] || exit 1
+          echo "config checks passed"
 
       - name: Download clang toolchain
         run: |
@@ -109,20 +148,22 @@ jobs:
           TC="$RUNNER_TEMP/clang"
           mkdir -p "$TC"
           cd "$TC"
-          for URL in \
-            "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android12-release/clang-r416183b1.tar.gz" \
-            "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-r416183b1.tar.gz" ; do
-            echo "trying $URL"
-            if curl -fsSL --retry 4 --retry-delay 5 --connect-timeout 25 -o clang.tar.gz "$URL"; then
-              echo "downloaded from $URL"
-              break
-            fi
-            rm -f clang.tar.gz
-          done
-          test -s clang.tar.gz || { echo "::error::clang download failed"; exit 1; }
+          # clang r547379: the toolchain the flash-verified local v5/v6 builds
+          # used (Android clang 20.0.0). If this download fails, the run must
+          # fail loudly — do NOT fall back to a different clang version.
+          URL="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android16-release/clang-r547379.tar.gz"
+          echo "downloading $URL"
+          curl -fsSL --retry 4 --retry-delay 5 --connect-timeout 25 -o clang.tar.gz "$URL" || {
+            echo "::error::clang r547379 download failed; refusing to build with a different toolchain"
+            exit 1
+          }
           tar -xzf clang.tar.gz -C .
           rm -f clang.tar.gz
-          ./bin/clang --version
+          ./bin/clang --version | tee /tmp/clang-version.txt
+          grep -q 'r547379' /tmp/clang-version.txt || {
+            echo "::error::downloaded toolchain is not clang r547379"
+            exit 1
+          }
 
       - name: Build kernel
         run: |
@@ -156,6 +197,49 @@ jobs:
           tail -n 15 "$RUNNER_TEMP/build.log"
           ls -lh out/arch/arm64/boot/Image.gz-dtb
 
+      - name: Verify built image
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/kernel"
+          zcat out/arch/arm64/boot/Image.gz-dtb > /tmp/Image.raw || true
+          test -s /tmp/Image.raw || { echo "::error::could not decompress built image"; exit 1; }
+          echo "--- kernel release string ---"
+          strings /tmp/Image.raw | grep -m1 'Linux version'
+          strings /tmp/Image.raw | grep -q '4.14.355-openela-Droidspaces' || {
+            echo "::error::kernel release string 4.14.355-openela-Droidspaces not found"
+            exit 1
+          }
+          echo "--- KernelSU embedded version string (regression gate) ---"
+          if ! strings /tmp/Image.raw | grep -q 'v3.0.1-legacy'; then
+            echo "::error::KernelSU version string 'v3.0.1-legacy' not found in image."
+            echo "::error::This is the tarball-fetch failure mode: KSU must be a real git checkout."
+            exit 1
+          fi
+          echo "--- ikconfig key symbols ---"
+          scripts/extract-ikconfig /tmp/Image.raw > /tmp/ikconfig.txt
+          for k in CONFIG_KSU CONFIG_KSU_MANUAL_HOOK CONFIG_KSU_SUSFS \
+                   CONFIG_POSIX_MQUEUE CONFIG_CFS_BANDWIDTH \
+                   CONFIG_MACH_XIAOMI_CEPHEUS CONFIG_OVERLAY_FS; do
+            grep -q "^${k}=y" /tmp/ikconfig.txt || {
+              echo "::error::ikconfig: $k is not =y"
+              exit 1
+            }
+          done
+          grep -q '^# CONFIG_SCHED_WALT is not set' /tmp/ikconfig.txt || {
+            echo "::error::ikconfig: CONFIG_SCHED_WALT must be off"
+            exit 1
+          }
+          grep -q '^CONFIG_LOCALVERSION="-Droidspaces"' /tmp/ikconfig.txt || {
+            echo "::error::ikconfig: CONFIG_LOCALVERSION mismatch"
+            exit 1
+          }
+          echo "--- close_range() patch anchor in source tree ---"
+          test "$(grep -c 'max_fd = min(last_fd(files_fdtable(cur_fds)), max_fd)' fs/file.c)" = "1" || {
+            echo "::error::close_range clamp anchor not found exactly once in fs/file.c"
+            exit 1
+          }
+          echo "all verification gates passed"
+
       - name: Package AnyKernel3 zip
         run: |
           set -euo pipefail
@@ -167,10 +251,9 @@ jobs:
           cp out/arch/arm64/boot/Image.gz-dtb "$RUNNER_TEMP/ak3/"
 
           cd "$RUNNER_TEMP/ak3"
-          # Reflect this build in the recovery banner.
-          VSTR="${{ inputs.artifact_name }}"
-          VSTR="${VSTR%.zip}"
-          sed -i "s|^kernel.string=.*|kernel.string=cepheus Droidspaces ${VSTR} (close_range fix) 4.14.355-openela-Droidspaces|" anykernel.sh
+          # Recovery banner: fixed wording tied to the release tag, so it
+          # matches the locally built packages (no artifact-name leakage).
+          sed -i "s|^kernel.string=.*|kernel.string=cepheus Droidspaces ${{ inputs.release_tag }} (close_range fix) 4.14.355-openela-Droidspaces|" anykernel.sh
           grep -m1 '^kernel.string=' anykernel.sh
 
           ZIPPATH="$RUNNER_TEMP/${{ inputs.artifact_name }}"
@@ -191,13 +274,17 @@ jobs:
       - name: Attach to release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ inputs.artifact_name }}
-          name: ${{ inputs.artifact_name }}
+          tag_name: ${{ inputs.release_tag }}
+          name: ${{ inputs.release_title }}
           body: |
-            Built from raystef66/kernel_xiaomi_cepheus @ ${{ env.HEAD_SHA }}
-            KernelSU-Next @ ${{ inputs.ksu_ref }}
-            Includes the `close_range()` fd-table clamp fix (see PATCH_NOTES.md).
+            Built from raystef66/kernel_xiaomi_cepheus @ ${{ env.HEAD_SHA }} (branch ${{ inputs.kernel_branch }})
+            KernelSU-Next @ ${{ inputs.ksu_ref }} — real git checkout; embedded version string v3.0.1-legacy-88 verified in CI before packaging.
+            Toolchain: AOSP clang r547379 (same as the flash-verified local builds).
+
+            Includes the `close_range()` fd-table clamp fix (`fs/file.c`, +5 lines — see PATCH_NOTES.md and BUILD-v6.md). Config is identical to v5: namespaces, CFS_BANDWIDTH (--cpus), POSIX_MQUEUE, OVERLAY_FS, SCHED_WALT off, BBR. Kernel release string: `4.14.355-openela-Droidspaces`.
+
+            ⚠️ Back up your boot partition before flashing. cepheus + crDroid 16 only.
           files: |
             ${{ runner.temp }}/${{ inputs.artifact_name }}
             ${{ runner.temp }}/SHA256SUMS
-          fail_on_unmatched_files: false
+          fail_on_unmatched_files: true
